@@ -85,8 +85,50 @@ impl HypervisorMetrics {
     }
 }
 
+#[derive(Clone)]
+pub struct PerfRecorder {
+    f: Arc<std::sync::Mutex<std::fs::File>>,
+}
+
+impl PerfRecorder {
+    fn new() -> Self {
+        use std::io::Write;
+        let path = std::path::Path::new("canister_perf.csv");
+        let mut f = std::fs::File::create(&path).expect("failed to create a perf file");
+        writeln!(
+            f,
+            "canister,method,instructions,accessed_pages,dirtied_pages,total_pages_in_use"
+        )
+        .expect("failed to write csv header");
+        Self {
+            f: Arc::new(std::sync::Mutex::new(f)),
+        }
+    }
+
+    fn record(
+        &self,
+        canister_id: &CanisterId,
+        method: &str,
+        instructions: u64,
+        accessed_pages: usize,
+        dirty_pages: usize,
+        total_pages: usize,
+    ) {
+        use std::io::Write;
+        let mut f = self.f.lock().unwrap();
+        writeln!(
+            f,
+            "{},{},{},{},{},{}",
+            canister_id, method, instructions, accessed_pages, dirty_pages, total_pages
+        )
+        .expect("failed to write perf record");
+        f.flush().expect("failed to flush")
+    }
+}
+
 #[doc(hidden)]
 pub struct Hypervisor {
+    perf: PerfRecorder,
     wasm_executor: Arc<WasmExecutor>,
     sandbox_executor: Option<Arc<SandboxedExecutionController>>,
     metrics: Arc<HypervisorMetrics>,
@@ -191,6 +233,7 @@ impl Hypervisor {
             subnet_records,
         );
         let output = execute(
+            self.perf.clone(),
             api_type,
             system_state.clone(),
             memory_usage,
@@ -297,6 +340,7 @@ impl Hypervisor {
                 // of system and execution states so that we have the original
                 // versions.
                 let output = execute(
+                    self.perf.clone(),
                     api_type,
                     system_state.clone(),
                     memory_usage,
@@ -346,6 +390,7 @@ impl Hypervisor {
                 // modify the canister as the caller is not going to be able to
                 // commit modifications to the canister anyway.
                 let output = execute(
+                    self.perf.clone(),
                     api_type,
                     system_state,
                     memory_usage,
@@ -479,6 +524,7 @@ impl Hypervisor {
         };
 
         let output = execute(
+            self.perf.clone(),
             api_type,
             canister.system_state.clone(),
             canister.memory_usage(self.own_subnet_type),
@@ -528,6 +574,7 @@ impl Hypervisor {
                             }
                         };
                         let cleanup_output = execute(
+                            self.perf.clone(),
                             ApiType::Cleanup { time },
                             canister.system_state.clone(),
                             canister_current_memory_usage,
@@ -625,6 +672,7 @@ impl Hypervisor {
         }
 
         let output = execute(
+            self.perf.clone(),
             ApiType::start(),
             SystemState::new_for_start(canister_id),
             memory_usage,
@@ -686,6 +734,7 @@ impl Hypervisor {
         }
 
         let output = execute(
+            self.perf.clone(),
             ApiType::pre_upgrade(time, caller),
             system_state.clone(),
             memory_usage,
@@ -747,6 +796,7 @@ impl Hypervisor {
         }
 
         let output = execute(
+            self.perf.clone(),
             ApiType::init(time, payload.to_vec(), caller),
             system_state.clone(),
             memory_usage,
@@ -808,6 +858,7 @@ impl Hypervisor {
         }
 
         let output = execute(
+            self.perf.clone(),
             ApiType::init(time, payload.to_vec(), caller),
             system_state.clone(),
             memory_usage,
@@ -854,6 +905,7 @@ impl Hypervisor {
         let system_api = ApiType::inspect_message(sender, method_name, method_payload, time);
         let log = self.log.clone();
         let output = execute(
+            self.perf.clone(),
             system_api,
             system_state,
             memory_usage,
@@ -958,6 +1010,7 @@ impl Hypervisor {
         );
 
         let output = execute(
+            self.perf.clone(),
             api_type,
             system_state.clone(),
             memory_usage,
@@ -1085,6 +1138,7 @@ impl Hypervisor {
         };
 
         Self {
+            perf: PerfRecorder::new(),
             wasm_executor: Arc::new(wasm_executor),
             sandbox_executor,
             metrics: Arc::new(HypervisorMetrics::new(metrics_registry)),
@@ -1117,6 +1171,7 @@ impl Hypervisor {
 #[allow(clippy::too_many_arguments)]
 #[doc(hidden)]
 pub fn execute(
+    perf: PerfRecorder,
     api_type: ApiType,
     system_state: SystemState,
     canister_current_memory_usage: NumBytes,
@@ -1129,6 +1184,9 @@ pub fn execute(
     sandbox_executor: Option<Arc<SandboxedExecutionController>>,
 ) -> WasmExecutionOutput {
     let api_type_str = api_type.as_str();
+    let fname = display_fn(&func_ref);
+    let canister_id = system_state.canister_id.clone();
+    let instruction_limit = execution_parameters.instruction_limit;
 
     let result = if let Some(sandbox_executor) = sandbox_executor {
         sandbox_executor.process(WasmExecutionInput {
@@ -1152,6 +1210,27 @@ pub fn execute(
         })
     };
 
+    let instructions_consumed = instruction_limit - result.num_instructions_left;
+
+    perf.record(
+        &canister_id,
+        &fname,
+        instructions_consumed.get(),
+        result.instance_stats.accessed_pages,
+        result.instance_stats.dirty_pages,
+        result.execution_state.wasm_memory.size.get(),
+    );
+
     metrics.observe(api_type_str, &result);
     result
+}
+
+fn display_fn(func_ref: &FuncRef) -> String {
+    match func_ref {
+        FuncRef::Method(WasmMethod::Update(s)) => format!("canister_update {}", s),
+        FuncRef::Method(WasmMethod::Query(s)) => format!("canister_query {}", s),
+        FuncRef::Method(WasmMethod::System(m)) => format!("{:?}", m),
+        FuncRef::UpdateClosure(c) => format!("closure_{}", c.func_idx),
+        FuncRef::QueryClosure(c) => format!("closure_{}", c.func_idx),
+    }
 }
